@@ -4,17 +4,11 @@
 # Stage 3 (runtime): clean image without compiler toolchain for production
 
 # UV source image (override for restricted networks that cannot reach ghcr.io)
-ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.7.20
-# PacGate: use docker.1ms.run mirror prefix for Docker Hub images (China network)
-ARG PYTHON_IMAGE=docker.1ms.run/library/python:3.12-slim-bookworm
-ARG DOCKER_CLI_IMAGE=docker.1ms.run/library/docker:cli
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.1
 FROM ${UV_IMAGE} AS uv-source
 
-# PacGate: named stage for Docker CLI (COPY --from doesn't support ARG expansion)
-FROM ${DOCKER_CLI_IMAGE} AS docker-cli-source
-
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
-FROM ${PYTHON_IMAGE} AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 ARG NODE_MAJOR=22
 ARG APT_MIRROR
@@ -34,6 +28,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
 # Install build tools + Node.js (build-essential needed for native Python extensions)
 RUN apt-get update && apt-get install -y \
     curl \
+    git \
     build-essential \
     gnupg \
     ca-certificates \
@@ -76,7 +71,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         esac; \
         extras_flags="$extras_flags --extra $extra"; \
     done; \
-    UV_INDEX_URL=${UV_INDEX_URL:-https://pypi.org/simple} uv sync --extra redis $extras_flags'
+    UV_INDEX_URL=${UV_INDEX_URL:-https://pypi.org/simple} uv sync --locked --extra redis $extras_flags'
 
 # UTF-8 locale prevents UnicodeEncodeError on Chinese/emoji content in minimal
 # containers where locale configuration may be missing and the default encoding is not UTF-8.
@@ -90,15 +85,15 @@ ENV PYTHONIOENCODING=utf-8
 FROM builder AS dev
 
 # Install Docker CLI (for DooD: allows starting sandbox containers via host Docker socket)
-COPY --from=docker-cli-source /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
 
 EXPOSE 8001
 
-CMD ["sh", "-c", "cd backend && PYTHONPATH=. uv run uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001"]
+CMD ["sh", "-c", "cd backend && PYTHONPATH=. uv run --no-sync uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001"]
 
 # ── Stage 3: Runtime ──────────────────────────────────────────────────────────
 # Clean image without build-essential — reduces size (~200 MB) and attack surface.
-FROM ${PYTHON_IMAGE}
+FROM python:3.12-slim-bookworm
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
@@ -114,33 +109,10 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm \
     && lark-cli --version
 
 # Install Docker CLI (for DooD: allows starting sandbox containers via host Docker socket)
-COPY --from=docker-cli-source /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
 
 # Install uv (source image overridable via UV_IMAGE build arg)
 COPY --from=uv-source /uv /uvx /usr/local/bin/
-
-# ── PacGate: Install OfficeCLI (Word/Excel/PPT automation MCP server) ──────────
-# Single static binary from GitHub releases; provides `officecli mcp` stdio server.
-# Pin to a specific version for reproducibility.
-# Runtime stage is a clean image without curl, so install curl + libicu
-# (OfficeCLI is a .NET binary that requires libicu for globalization).
-ARG OFFICECLI_VERSION=1.0.139
-RUN apt-get update && apt-get install -y --no-install-recommends curl libicu72 \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL -o /usr/local/bin/officecli \
-      "https://github.com/iOfficeAI/OfficeCLI/releases/download/v${OFFICECLI_VERSION}/officecli-linux-x64" \
-    && chmod +x /usr/local/bin/officecli \
-    && apt-get purge -y curl && apt-get autoremove -y
-
-# ── PacGate: Install markitdown-mcp (PDF/DOCX → Markdown conversion MCP) ───────
-# markitdown-mcp provides `python -m markitdown_mcp` stdio MCP server for
-# converting various file formats to Markdown. Useful for DD data room ingestion.
-# ffmpeg is installed for audio/video conversion support (silences pydub warning).
-# weasyprint generates PDF from HTML/CSS (for DD report PDF output).
-# pango/cairo are weasyprint system dependencies.
-RUN pip install --no-cache-dir markitdown-mcp weasyprint \
-    && apt-get update && apt-get install -y --no-install-recommends ffmpeg libpango-1.0-0 libpangoft2-1.0-0 \
-    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
